@@ -37,6 +37,56 @@ static void GBVideoSoftwareRendererPutPixels(struct GBVideoRenderer* renderer, s
 static void GBVideoSoftwareRendererDrawBackground(struct GBVideoSoftwareRenderer* renderer, uint8_t* maps, int startX, int endX, int sx, int sy, bool highlight);
 static void GBVideoSoftwareRendererDrawObj(struct GBVideoSoftwareRenderer* renderer, struct GBVideoRendererSprite* obj, int startX, int endX, int y);
 
+
+// Golden Coins: what drew the pixels of a row, kept beside it (struct GBVideoCapture).
+static inline void _markBackground(struct GBVideoSoftwareRenderer* renderer, int x, int count, int tile) {
+	int i;
+	for (i = 0; i < count; ++i) {
+		renderer->rowTile[x + i] = tile;
+		renderer->rowLayer[x + i] = renderer->drawingLayer;
+		renderer->rowObj[x + i] = GB_CAPTURE_NO_OBJ;
+	}
+}
+
+// A background tile's number (struct GBVideoCapture), from its number in the map.
+static inline int _tileNumber(struct GBVideoSoftwareRenderer* renderer, int mapTile, bool bank1) {
+	int tile = GBRegisterLCDCIsTileData(renderer->lcdc) ? mapTile : 256 + mapTile;
+	return bank1 ? tile + 384 : tile;
+}
+
+static inline void _markNothing(struct GBVideoSoftwareRenderer* renderer, int startX, int endX) {
+	memset(&renderer->rowTile[startX], 0, (endX - startX) * sizeof(renderer->rowTile[0]));
+	memset(&renderer->rowLayer[startX], GB_CAPTURE_NONE, endX - startX);
+	memset(&renderer->rowObj[startX], GB_CAPTURE_NO_OBJ, endX - startX);
+}
+
+static inline void _objPixel(struct GBVideoSoftwareRenderer* renderer, int x, uint16_t value, int index, int tile) {
+	renderer->row[x] = value;
+	renderer->rowTile[x] = tile;
+	renderer->rowLayer[x] = GB_CAPTURE_OBJ;
+	renderer->rowObj[x] = index;
+}
+
+static void _captureRange(struct GBVideoSoftwareRenderer* renderer, int startX, int endX, int y) {
+	struct GBVideoCapture* capture = renderer->capture;
+	int x;
+	if (y < 0 || y >= GB_VIDEO_VERTICAL_PIXELS) {
+		return;
+	}
+	if (startX == 0) {
+		capture->scx[y] = renderer->scx;
+		capture->scy[y] = renderer->scy;
+		capture->wx[y] = renderer->wx;
+		capture->wy[y] = renderer->wy;
+		capture->lcdc[y] = renderer->lcdc;
+	}
+	for (x = startX; x < endX && x < GB_VIDEO_HORIZONTAL_PIXELS; ++x) {
+		capture->layer[y][x] = renderer->rowLayer[x];
+		capture->color[y][x] = renderer->row[x] & 0x3F;
+		capture->tile[y][x] = renderer->rowTile[x];
+		capture->obj[y][x] = renderer->rowObj[x];
+	}
+}
 static void _clearScreen(struct GBVideoSoftwareRenderer* renderer) {
 	size_t sgbOffset = 0;
 	if (renderer->model & GB_MODEL_SGB) {
@@ -220,6 +270,8 @@ void GBVideoSoftwareRendererCreate(struct GBVideoSoftwareRenderer* renderer) {
 	renderer->d.highlightAmount = 0;
 
 	renderer->temporaryBuffer = 0;
+	renderer->capture = NULL;
+	renderer->drawingLayer = GB_CAPTURE_BG;
 }
 
 static void GBVideoSoftwareRendererInit(struct GBVideoRenderer* renderer, enum GBModel model, bool sgbBorders) {
@@ -600,6 +652,7 @@ static void GBVideoSoftwareRendererDrawRange(struct GBVideoRenderer* renderer, i
 	}
 	if (softwareRenderer->d.disableBG) {
 		memset(&softwareRenderer->row[startX], 0, (endX - startX) * sizeof(softwareRenderer->row[0]));
+		_markNothing(softwareRenderer, startX, endX);
 	}
 	if (GBRegisterLCDCIsBgEnable(softwareRenderer->lcdc) || softwareRenderer->model >= GB_MODEL_CGB) {
 		int wy = softwareRenderer->wy + softwareRenderer->currentWy;
@@ -609,6 +662,7 @@ static void GBVideoSoftwareRendererDrawRange(struct GBVideoRenderer* renderer, i
 		}
 		if (GBRegisterLCDCIsWindow(softwareRenderer->lcdc) && softwareRenderer->hasWindow && wx <= endX && !softwareRenderer->d.disableWIN) {
 			if (wx > 0 && !softwareRenderer->d.disableBG) {
+				softwareRenderer->drawingLayer = GB_CAPTURE_BG;
 				GBVideoSoftwareRendererDrawBackground(softwareRenderer, maps, startX, wx, softwareRenderer->scx - softwareRenderer->offsetScx, softwareRenderer->scy + y - softwareRenderer->offsetScy, renderer->highlightBG);
 			}
 
@@ -616,12 +670,15 @@ static void GBVideoSoftwareRendererDrawRange(struct GBVideoRenderer* renderer, i
 			if (GBRegisterLCDCIsWindowTileMap(softwareRenderer->lcdc)) {
 				maps += GB_SIZE_MAP;
 			}
+			softwareRenderer->drawingLayer = GB_CAPTURE_WINDOW;
 			GBVideoSoftwareRendererDrawBackground(softwareRenderer, maps, wx, endX, -wx - softwareRenderer->offsetWx, y - wy - softwareRenderer->offsetWy, renderer->highlightWIN);
 		} else if (!softwareRenderer->d.disableBG) {
+			softwareRenderer->drawingLayer = GB_CAPTURE_BG;
 			GBVideoSoftwareRendererDrawBackground(softwareRenderer, maps, startX, endX, softwareRenderer->scx - softwareRenderer->offsetScx, softwareRenderer->scy + y - softwareRenderer->offsetScy, renderer->highlightBG);
 		}
 	} else if (!softwareRenderer->d.disableBG) {
 		memset(&softwareRenderer->row[startX], 0, (endX - startX) * sizeof(softwareRenderer->row[0]));
+		_markNothing(softwareRenderer, startX, endX);
 	}
 
 	if (startX == 0) {
@@ -632,6 +689,10 @@ static void GBVideoSoftwareRendererDrawRange(struct GBVideoRenderer* renderer, i
 		for (i = 0; i < softwareRenderer->objMax; ++i) {
 			GBVideoSoftwareRendererDrawObj(softwareRenderer, &softwareRenderer->obj[i], startX, endX, y);
 		}
+	}
+
+	if (softwareRenderer->capture) {
+		_captureRange(softwareRenderer, startX, endX, y);
 	}
 
 	unsigned highlightAmount = (renderer->highlightAmount + 6) >> 4;
@@ -839,6 +900,10 @@ static void GBVideoSoftwareRendererFinishFrame(struct GBVideoRenderer* renderer)
 	}
 	if (!GBRegisterLCDCIsEnable(softwareRenderer->lcdc)) {
 		_clearScreen(softwareRenderer);
+		if (softwareRenderer->capture) {
+			memset(softwareRenderer->capture->layer, GB_CAPTURE_NONE, sizeof(softwareRenderer->capture->layer));
+			memset(softwareRenderer->capture->obj, GB_CAPTURE_NO_OBJ, sizeof(softwareRenderer->capture->obj));
+		}
 	}
 	if (softwareRenderer->model & GB_MODEL_SGB) {
 		switch (softwareRenderer->sgbCommandHeader >> 3) {
@@ -938,6 +1003,7 @@ static void GBVideoSoftwareRendererDrawBackground(struct GBVideoSoftwareRenderer
 			tileDataUpper >>= bottomX;
 			tileDataLower >>= bottomX;
 			renderer->row[x] = p | ((tileDataUpper & 1) << 1) | (tileDataLower & 1);
+			_markBackground(renderer, x, 1, _tileNumber(renderer, bgTile, localData != data));
 		}
 		startX = startX2;
 	}
@@ -975,6 +1041,7 @@ static void GBVideoSoftwareRendererDrawBackground(struct GBVideoSoftwareRenderer
 				renderer->row[x + 5] = p | ((tileDataUpper & 32) >> 4) | ((tileDataLower & 32) >> 5);
 				renderer->row[x + 6] = p | ((tileDataUpper & 64) >> 5) | ((tileDataLower & 64) >> 6);
 				renderer->row[x + 7] = p | ((tileDataUpper & 128) >> 6) | ((tileDataLower & 128) >> 7);
+				_markBackground(renderer, x, 8, _tileNumber(renderer, bgTile, localData != data));
 				continue;
 			}
 		}
@@ -988,6 +1055,7 @@ static void GBVideoSoftwareRendererDrawBackground(struct GBVideoSoftwareRenderer
 		renderer->row[x + 2] = p | ((tileDataUpper & 32) >> 4) | ((tileDataLower & 32) >> 5);
 		renderer->row[x + 1] = p | ((tileDataUpper & 64) >> 5) | ((tileDataLower & 64) >> 6);
 		renderer->row[x + 0] = p | ((tileDataUpper & 128) >> 6) | ((tileDataLower & 128) >> 7);
+		_markBackground(renderer, x, 8, _tileNumber(renderer, bgTile, localData != data));
 	}
 }
 
@@ -1042,6 +1110,7 @@ static void GBVideoSoftwareRendererDrawObj(struct GBVideoSoftwareRenderer* rende
 	int bottomX;
 	int x = startX;
 	int objTile = obj->obj.tile + tileOffset;
+	int objTileNumber = objTile + (data != renderer->d.vram ? 384 : 0);
 	if ((x - objX) & 7) {
 		for (; x < endX; ++x) {
 			if (GBObjAttributesIsXFlip(obj->obj.attr)) {
@@ -1055,7 +1124,7 @@ static void GBVideoSoftwareRendererDrawObj(struct GBVideoSoftwareRenderer* rende
 			tileDataLower >>= bottomX;
 			unsigned current = renderer->row[x];
 			if (((tileDataUpper | tileDataLower) & 1) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-				renderer->row[x] = p | ((tileDataUpper & 1) << 1) | (tileDataLower & 1);
+				_objPixel(renderer, x, p | ((tileDataUpper & 1) << 1) | (tileDataLower & 1), obj->index, objTileNumber);
 			}
 		}
 	} else if (GBObjAttributesIsXFlip(obj->obj.attr)) {
@@ -1064,35 +1133,35 @@ static void GBVideoSoftwareRendererDrawObj(struct GBVideoSoftwareRenderer* rende
 		unsigned current;
 		current = renderer->row[x];
 		if (((tileDataUpper | tileDataLower) & 1) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x] = p | ((tileDataUpper & 1) << 1) | (tileDataLower & 1);
+			_objPixel(renderer, x, p | ((tileDataUpper & 1) << 1) | (tileDataLower & 1), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 1];
 		if (((tileDataUpper | tileDataLower) & 2) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 1] = p | (tileDataUpper & 2) | ((tileDataLower & 2) >> 1);
+			_objPixel(renderer, x + 1, p | (tileDataUpper & 2) | ((tileDataLower & 2) >> 1), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 2];
 		if (((tileDataUpper | tileDataLower) & 4) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 2] = p | ((tileDataUpper & 4) >> 1) | ((tileDataLower & 4) >> 2);
+			_objPixel(renderer, x + 2, p | ((tileDataUpper & 4) >> 1) | ((tileDataLower & 4) >> 2), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 3];
 		if (((tileDataUpper | tileDataLower) & 8) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 3] = p | ((tileDataUpper & 8) >> 2) | ((tileDataLower & 8) >> 3);
+			_objPixel(renderer, x + 3, p | ((tileDataUpper & 8) >> 2) | ((tileDataLower & 8) >> 3), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 4];
 		if (((tileDataUpper | tileDataLower) & 16) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 4] = p | ((tileDataUpper & 16) >> 3) | ((tileDataLower & 16) >> 4);
+			_objPixel(renderer, x + 4, p | ((tileDataUpper & 16) >> 3) | ((tileDataLower & 16) >> 4), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 5];
 		if (((tileDataUpper | tileDataLower) & 32) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 5] = p | ((tileDataUpper & 32) >> 4) | ((tileDataLower & 32) >> 5);
+			_objPixel(renderer, x + 5, p | ((tileDataUpper & 32) >> 4) | ((tileDataLower & 32) >> 5), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 6];
 		if (((tileDataUpper | tileDataLower) & 64) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 6] = p | ((tileDataUpper & 64) >> 5) | ((tileDataLower & 64) >> 6);
+			_objPixel(renderer, x + 6, p | ((tileDataUpper & 64) >> 5) | ((tileDataLower & 64) >> 6), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 7];
 		if (((tileDataUpper | tileDataLower) & 128) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 7] = p | ((tileDataUpper & 128) >> 6) | ((tileDataLower & 128) >> 7);
+			_objPixel(renderer, x + 7, p | ((tileDataUpper & 128) >> 6) | ((tileDataLower & 128) >> 7), obj->index, objTileNumber);
 		}
 	} else {
 		uint8_t tileDataLower = data[(objTile * 8 + bottomY) * 2];
@@ -1100,35 +1169,35 @@ static void GBVideoSoftwareRendererDrawObj(struct GBVideoSoftwareRenderer* rende
 		unsigned current;
 		current = renderer->row[x + 7];
 		if (((tileDataUpper | tileDataLower) & 1) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 7] = p | ((tileDataUpper & 1) << 1) | (tileDataLower & 1);
+			_objPixel(renderer, x + 7, p | ((tileDataUpper & 1) << 1) | (tileDataLower & 1), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 6];
 		if (((tileDataUpper | tileDataLower) & 2) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 6] = p | (tileDataUpper & 2) | ((tileDataLower & 2) >> 1);
+			_objPixel(renderer, x + 6, p | (tileDataUpper & 2) | ((tileDataLower & 2) >> 1), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 5];
 		if (((tileDataUpper | tileDataLower) & 4) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 5] = p | ((tileDataUpper & 4) >> 1) | ((tileDataLower & 4) >> 2);
+			_objPixel(renderer, x + 5, p | ((tileDataUpper & 4) >> 1) | ((tileDataLower & 4) >> 2), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 4];
 		if (((tileDataUpper | tileDataLower) & 8) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 4] = p | ((tileDataUpper & 8) >> 2) | ((tileDataLower & 8) >> 3);
+			_objPixel(renderer, x + 4, p | ((tileDataUpper & 8) >> 2) | ((tileDataLower & 8) >> 3), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 3];
 		if (((tileDataUpper | tileDataLower) & 16) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 3] = p | ((tileDataUpper & 16) >> 3) | ((tileDataLower & 16) >> 4);
+			_objPixel(renderer, x + 3, p | ((tileDataUpper & 16) >> 3) | ((tileDataLower & 16) >> 4), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 2];
 		if (((tileDataUpper | tileDataLower) & 32) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 2] = p | ((tileDataUpper & 32) >> 4) | ((tileDataLower & 32) >> 5);
+			_objPixel(renderer, x + 2, p | ((tileDataUpper & 32) >> 4) | ((tileDataLower & 32) >> 5), obj->index, objTileNumber);
 		}
 		current = renderer->row[x + 1];
 		if (((tileDataUpper | tileDataLower) & 64) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x + 1] = p | ((tileDataUpper & 64) >> 5) | ((tileDataLower & 64) >> 6);
+			_objPixel(renderer, x + 1, p | ((tileDataUpper & 64) >> 5) | ((tileDataLower & 64) >> 6), obj->index, objTileNumber);
 		}
 		current = renderer->row[x];
 		if (((tileDataUpper | tileDataLower) & 128) && !(current & mask) && (current & mask2) <= OBJ_PRIORITY) {
-			renderer->row[x] = p | ((tileDataUpper & 128) >> 6) | ((tileDataLower & 128) >> 7);
+			_objPixel(renderer, x, p | ((tileDataUpper & 128) >> 6) | ((tileDataLower & 128) >> 7), obj->index, objTileNumber);
 		}
 	}
 }
